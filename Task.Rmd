@@ -1,8 +1,8 @@
 ---
 title: "Lilach Ben Tov - Task "
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 ---
 
 Install and upload packages:
