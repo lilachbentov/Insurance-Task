@@ -1,0 +1,315 @@
+---
+title: "Lilach Ben Tov - Task "
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Install and upload packages:
+```{r include=FALSE}
+#install.packages("sqldf")
+#install.packages("eeptools")
+#install.packages("data.table")
+library(sqldf)
+library(proto)
+library(gsubfn)
+library(RSQLite)
+library(eeptools)
+library(data.table)
+library(ggplot2)
+library(rmarkdown)
+```
+
+Importing the data sets:
+```{r}
+Exposure<-read.csv(file="files/Exposure_file2.csv",header=TRUE, sep=",")
+Claims<-read.csv(file="files/Claims_file.csv",header=TRUE, sep=",", )
+```
+
+## Step 1 - Data preprocessing ##
+Checking for missing values and validating data. 
+
+### Preprocessing Exposure Table ###
+```{r}
+class(Exposure)
+dim(Exposure)
+summary(Exposure)
+sapply(Exposure,class)
+```
+
+By looking at the summary report I validated that there are no casesensitive mismatch and neither missing data. 
+In addtion, I found that the dates columns are defined as *factors* and not as *date* type, therefore I defined them as *date* tpye by using `as.Date` function:
+```{r}
+Exposure[,4]<-as.Date(Exposure[,4],format=c("%m/%d/%Y"))
+Exposure[,5]<-as.Date(Exposure[,5],format=c("%m/%d/%Y"))
+Exposure[,6]<-as.Date(Exposure[,6],format=c("%m/%d/%Y"))
+```
+
+Validate the change
+```{r}
+summary(Exposure)
+sapply(Exposure,class)
+```
+
+I wrote a utility function that iterates over a data frame and returns columns with missing data
+```{r}
+NAfunction<-function(x){
+  dim2<-dim(x)[2]
+  vec<-rep.int(0,dim(x)[2])
+  for (i in 1:dim2){
+    if (anyNA(Exposure[,i])==TRUE){
+      vec[i]<-1
+      i<-i+1
+    }else
+      i<-i+1
+
+  }
+  return(colnames(x[which(vec>0)]))
+}
+```
+Running the function on the data frame:
+```{r}
+NAfunction(Exposure)
+```
+As expected, only the sixth column has NA values
+
+Removal of duplicate rows (if there any):
+```{r}
+CleanExposure<-unique(Exposure)
+```
+
+### Preprocessing Claims Table ###
+```{r}
+class(Claims)
+dim(Claims)
+summary(Claims)
+sapply(Claims,class)
+```
+
+Defining the third column class as type *date*
+```{r}
+Claims[,3]<-as.Date(Claims[,3],format=c("%d/%m/%Y"))
+```
+
+Validate the change
+```{r}
+summary(Claims)
+sapply(Claims,class)
+```
+Looking for NA columns:
+```{r}
+NAfunction(Claims)
+```
+As expected, no missing data 
+
+Removal of duplicate rows (if there any):
+```{r}
+CleanClaims<-unique(Claims)
+```
+
+## Adding new column **age** -> calculate the user age based on the date of birth ##
+```{r}
+CleanExposure[,8]<-age_calc(CleanExposure$DOB,units="years",precise=FALSE)
+colnames(CleanExposure)[8]<-"Age"
+```
+## adding new column **duration of being insured**:  -> calculates the duration of being insured ##
+```{r}
+CleanExposure[is.na(CleanExposure$POLICY_END_DATE),6]<-as.Date('2018-12-01')
+CleanExposure[,9]<-age_calc(CleanExposure$POLICY_START_DATE,enddate=as.Date(CleanExposure$POLICY_END_DATE),units="years", precise=FALSE)
+colnames(CleanExposure)[9]<-"Duration_by_years"
+
+CleanExposure[,6]<-as.Date(Exposure[,6],format=c("%d/%m/%Y"))
+CleanExposure[,9]<-as.integer(CleanExposure[,9])
+
+```
+ 
+## Run SQL Queries ##
+Create a table **SumClaims** that caluclates the number of claims and claim size per user id.
+
+Createing a table **SumData** that joins **SumClaims** table and the **Exposure** table by user id and calculates the profit by user id
+
+```{r}
+SumClaims<-sqldf("select ID, sum(CLAIM_SIZE) AS CLAIM_SIZE, COUNT(*) AS NUMBER_OF_CLAIMS
+ FROM CleanClaims group by 1 ")
+
+SumData<-sqldf("select E.*, (C.CLAIM_SIZE), (C.NUMBER_OF_CLAIMS),
+(case when C.CLAIM_SIZE is null then E.TOTAL_PREMIUM_PAID_TO_DATE else E.TOTAL_PREMIUM_PAID_TO_DATE-C.CLAIM_SIZE END) AS PROFIT
+FROM CleanExposure E left join SumClaims C on E.ID=C.ID ")
+```
+## Adding new column **Margin** -> profit / revenue ##
+```{r}
+SumData[,13]<-SumData[,12]/SumData[,7]
+colnames(SumData)[13]<-"Margin"
+```
+Since there is no revenue for users that started the insurance policy at the 30-11-2018 I removed those users
+
+```{r}
+SumData<-SumData[c(SumData$TOTAL_PREMIUM_PAID_TO_DATE>0),]
+```
+
+Setting users that didn't submit a claim (null value) to 0
+```{r}
+SumData$NUMBER_OF_CLAIMS = ifelse(is.na(SumData$NUMBER_OF_CLAIMS), 0, SumData$NUMBER_OF_CLAIMS)
+
+SumData$CLAIM_SIZE = ifelse(is.na(SumData$CLAIM_SIZE), 0, SumData$CLAIM_SIZE)
+
+```
+
+
+## Step 2 - Build Regression model ##
+
+### Build multiple regression model: ###
+Margin = a + b1xSMOKER + b2xOCCUPATION + b3xAge + b4xDuration_by_days ###
+In order to measure the most profitable/costy customers for the company and to remove the difference between old and new customers over time I chose to use Margin (profit / revenw) as my dependent value
+```{r}
+dataset<-SumData[,c(2,3,8,9,13)]
+```
+### Encoding categorical data ###
+
+```{r}
+dataset<-SumData[,c(2,3,8,9,13)]
+dataset$SMOKER = factor(dataset$SMOKER,
+                       levels = c('FALSE','TRUE'),
+                       labels = c(0,1))
+dataset$OCCUPATION = factor(dataset$OCCUPATION,
+                        levels = c('BLUE_COLLAR','HEAVY_BLUE_COLLAR', 'WHITE_COLLAR' ),
+                        labels = c(1,2,3))
+```
+
+### Feature Scaling (Age and duration) ###
+```{r}
+dataset[,3:4] = scale(dataset[,3:4])
+```
+### Fitting Multiple Linear Regression ###
+```{r}
+regressor = lm(formula = Margin ~ . ,
+               data = dataset)
+
+summary(regressor)
+```
+
+### Analysis conculsations ###
+From the analysis we can clearly see that WHITE_COLLAR & Duration_by_days are more profitable for the insurance company. Age has a significant negative significant impact on the company margin.
+
+
+## Step 3 - Based on the analysis checking each parameter individually ##
+
+### Checking the OCCUPATION parameter: ###
+```{r}
+SumData<-as.data.table(SumData)
+
+Occupation_table<-sqldf("select OCCUPATION, sum(Margin) as Sum_Margin, avg(Margin) as mean_Margin, (avg(Margin*Margin)-avg(Margin)*Avg(Margin)) as Variance
+                        from SumData group by 1 ")
+
+Occupation_table
+
+ggplot(SumData, aes(x = OCCUPATION, y = Margin)) +
+  geom_boxplot(fill = "grey80", colour = "black") +
+  scale_x_discrete() + xlab("OCCUPATION Group") +
+  ylab("Margin")
+```
+
+### Analysis conculsations ###
+The mean margin is much higher for WHITE_COLLAR and Variance significantly small (imply for less cost claims).
+
+
+### Checking the age parameter: ###
+```{r}
+
+Age_table<-sqldf("select Age, sum(Margin) as Sum_Margin, avg(Margin) as mean_Margin, (avg(Margin*Margin)-avg(Margin)*Avg(Margin)) as Variance,
+                       sum(NUMBER_OF_CLAIMS) as NUMBER_OF_CLAIMS, count(*), sum(NUMBER_OF_CLAIMS)/count(*)*100 as percentage from SumData group by 1 ")
+
+ggplot() +
+  geom_point(aes(x = Age_table$Age, y = Age_table$mean_Margin),
+             colour = 'red') +
+  geom_line(aes(x = Age_table$Age, y = Age_table$mean_Margin),
+            colour = 'blue') +
+  ggtitle('Mean Margin vs Age') +
+  xlab('Age') +
+  ylab('Mean Margin')
+
+ggplot() +
+  geom_point(aes(x = Age_table$Age, y = Age_table$percentage),
+             colour = 'red') +
+  geom_line(aes(x = Age_table$Age, y = Age_table$percentage),
+            colour = 'blue') +
+  ggtitle('Percentage of claims vs Age') +
+  xlab('Age') +
+  ylab('Percentage of claim')
+```
+
+### Analysis conculsations ###
+There is a decrease in the margin starting at the age of 50 up to the age of 60. We can see a jump above the age of 60 but that might be related to the fact that we had only 4 customers in our data.
+There is a significant increase in the percentage of claims from age 50 and above.
+
+### Checking the duration: ###
+
+```{r}
+
+Duration_table<-sqldf("select Duration_by_years, sum(Margin) as Sum_Margin, 
+avg(Margin) as mean_Margin, 
+(avg(Margin*Margin)-avg(Margin)*Avg(Margin)) as Variance,
+sum(NUMBER_OF_CLAIMS) as NUMBER_OF_CLAIMS, count(*), sum(NUMBER_OF_CLAIMS)/count(*)*100 as percentage
+                 from SumData group by 1 ")
+
+
+ggplot() +
+  geom_point(aes(x = Duration_table$Duration_by_years, y = Duration_table$Sum_Margin),
+             colour = 'red') +
+  geom_line(aes(x = Duration_table$Duration_by_years, y = Duration_table$Sum_Margin),
+            colour = 'blue') +
+  ggtitle('Sum Margin vs Duration by years ') +
+  xlab('Duration by years') +
+  ylab('Sum Margin')
+
+ggplot() +
+  geom_point(aes(x = Duration_table$Duration_by_years, y = Duration_table$percentage),
+             colour = 'red') +
+  geom_line(aes(x = Duration_table$Duration_by_years, y = Duration_table$percentage),
+            colour = 'blue') +
+  ggtitle('Percentage of claims vs Duration by years') +
+  xlab('Duration by years') +
+  ylab('Percentage of claims')
+
+ggplot() +
+  geom_point(aes(x = Duration_table$Duration_by_years, y = Duration_table$Variance),
+             colour = 'red') +
+  geom_line(aes(x = Duration_table$Duration_by_years, y = Duration_table$Variance),
+            colour = 'blue') +
+  ggtitle('Variance vs Duration by years') +
+  xlab('Duration by years') +
+  ylab('Variance')
+
+```
+
+### Analysis conculsations ###
+
+Margin increase over time (as expected), variance decrease over time. 
+And number of complaints decrease after the 6th year of being insured.
+
+## Step 4 - Test conclusions: ##
+### questions 1 ###
+The most profitable costumer was mesured by the margin (= profit/revenue). By using the multiple regression results and following the charts I created we can see the following that the occupation WHITE_COLLAR has significant and positive impact on margin. In addition, the WHITE_COLLAR occupation's mean margin and the total margin are positive and the variance is signnificantly small while the two others occupations mean marin and total margin are negative and it's variance is high. Therefore, the WHITE_COLLAR customers are the most profitable type of customer. 
+
+### questions 2 ###
+The most risky customers were measured by their number of complaints. The results show that people above the age of 50 are much more risky for the company. 
+
+### questions 3 ###
+I recommend for DataIns to focus on marketing on the following audience:
+
+1. There is a big potential of future profit by keeping existing customers that has been insured for more than 6 years since the amount of claims reduces over time. The fact that the insurance model is terminating the customer contract when a claim was submitted actually keeps the "good" customers. I would recommend to focus on existing customers that has been insured for more than 6 years and are younger than the age of 44.
+
+2. New potential customers that has been insured for more than 6 years in a different company but younger than the age of 44 and have no record of complaint submitted.
+
+3. Customers with the occupation of the type WHITE_COLLAR. 
+ 
+
+
+
+
+
+
+
+
+
+
